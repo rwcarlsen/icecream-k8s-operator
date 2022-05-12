@@ -24,4 +24,4 @@ containers:
 resources:
   icecream-image:
     type: oci-image
-    description: OCI image for httpbin (rwcarlsen/icecream)
+    description: OCI image for httpbin (ubuntu:jammy)
