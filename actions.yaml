@@ -7,10 +7,15 @@
 #
 # Learn more about actions at: https://juju.is/docs/sdk/actions
 
-fortune:
-  description: Returns a pithy phrase.
-  params:
-    fail:
-      description: "Fail with this message"
-      type: string
-      default: ""
+#fortune:
+#  description: Returns a pithy phrase.
+#  params:
+#    fail:
+#      description: "Fail with this message"
+#      type: string
+#      default: ""
+
+ccache-stats:
+  description: "Retrieve statistics for ccache usage"
+scheduler:
+  description: "Show the scheduler/server addres"

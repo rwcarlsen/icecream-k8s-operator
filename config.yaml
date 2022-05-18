@@ -12,3 +12,8 @@ options:
     default: 🎁
     description: A thing used by the charm.
     type: string
+
+  ccache:
+    type: boolean
+    default: false
+    description: "Turn ccache usage on/off."

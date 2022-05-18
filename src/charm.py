@@ -7,6 +7,7 @@
 
 import logging
 import sys
+import time
 
 from ops.charm import CharmBase
 from ops.framework import StoredState
@@ -27,22 +28,12 @@ class IcecreamK8SOperatorCharm(CharmBase):
         self.framework.observe(self.on.nodes_relation_changed, self._on_peer_relation_changed)
 
         self.framework.observe(self.on.config_changed, self._on_config_changed)
-        self.framework.observe(self.on.fortune_action, self._on_fortune_action)
+        self.framework.observe(self.on.ccache_stats_action, self._on_ccache_stats_action)
         self._stored.set_default(things=[])
 
     def _on_icecream_pebble_ready(self, event):
         container = event.workload
-
-        # install icecream on workload container
-        try:
-            process = container.exec(['apt', 'update', '-y'])
-            process.wait()
-            process = container.exec(['apt', 'install', '-y', 'icecc'], stdout=sys.stdout, stderr=sys.stderr)
-            process.wait()
-        except Exception as err:
-            logger.error('Failed to install package: {}'.format(err))
-            self.unit.status = BlockedStatus('failed icecc install')
-            return
+        self._install_workload(container)
 
         if self.unit.is_leader():
             # start the scheduler
@@ -57,9 +48,8 @@ class IcecreamK8SOperatorCharm(CharmBase):
                 },
             }
             container.add_layer("icecc-scheduler", pebble_layer, combine=True)
-
             container.autostart()
-            self.unit.status = ActiveStatus()
+            self.unit.status = wait_service(container, 'icecc-scheduler')
 
             # set scheduler address for peer worker nodes
             r = self.model.get_relation('nodes')
@@ -67,39 +57,116 @@ class IcecreamK8SOperatorCharm(CharmBase):
             r.data[self.app].update({'scheduler_addr': scheduler_addr})
 
     def _on_peer_relation_changed(self, event):
+        self._restart_worker(event)
 
-        scheduler_addr = None
-        if 'scheduler_addr' in event.relation.data[self.app]:
-            scheduler_addr = event.relation.data[self.app]['scheduler_addr']
+    def _on_config_changed(self, event):
+        self._restart_worker(event)
 
-        if scheduler_addr:
-            pebble_layer = {
-                "services": {
-                    "iceccd": {
-                        "override": "replace",
-                        "summary": "icecream worker service",
-                        "command": "iceccd -vvv -s {}".format(scheduler_addr),
-                        "startup": "enabled",
-                    }
-                },
-            }
-            container = self.unit.get_container('icecream')
-            container.add_layer("iceccd", pebble_layer, combine=True)
-            container.replan()
-            self.unit.status = ActiveStatus()
+    def _on_ccache_stats_action(self, event):
+        #foo = event.params["foo"]
+        state = WorldState(charm=self)
+        if not state.connected:
+            event.fail(message='not connected to workload')
 
-    def _on_config_changed(self, _):
-        current = self.config["thing"]
-        if current not in self._stored.things:
-            logger.debug("found a new thing: %r", current)
-            self._stored.things.append(current)
+        process = state.container.exec(['ccache', '--show-stats'])
+        stats, stderr = process.wait_output()
+        event.set_results({"stats": stats})
 
-    def _on_fortune_action(self, event):
-        fail = event.params["fail"]
-        if fail:
-            event.fail(fail)
+    def _on_scheduler_action(self, event):
+        #foo = event.params["foo"]
+        state = WorldState(charm=self)
+        if not state.connected:
+            event.fail(message='not connected to workload')
+
+        event.set_results({"address": state.scheduler_addr})
+
+    def _install_workload(self, container):
+        # install icecream, ccache on workload container
+        try:
+            process = container.exec(['apt', 'update', '-y'])
+            process.wait()
+            process = container.exec(['apt', 'install', '-y', 'icecc', 'ccache'], stdout=sys.stdout, stderr=sys.stderr)
+            process.wait()
+            process.wait()
+        except Exception as err:
+            logger.error('Failed to update and install packages: {}'.format(err))
+            self.unit.status = BlockedStatus('failed icecc install')
+            return
+
+    def _restart_worker(self, event):
+        state = WorldState(charm=self)
+        if state.need_worker_restart():
+            state.container.add_layer("iceccd", state.worker_layer(), combine=True)
+            state.container.replan()
+            self.unit.status = wait_service(state.container, 'iceccd')
         else:
-            event.set_results({"fortune": "A bug in the code is worth two in the documentation."})
+            logger.debug('got event {!r} with no scheduler address'.format(event))
+
+def wait_service(container, service_name, interval=1, n_try=10):
+    for i in range(n_try):
+        try:
+            s = container.get_service(service_name)
+        except Exception as err:
+            logger.debug(err)
+        if s.is_running():
+            return ActiveStatus()
+        time.sleep(interval)
+    return BlockedStatus('timed out waiting for service {}'.format(service_name))
+
+class WorldState:
+    def __init__(self, charm=None):
+        self.charm = charm
+        self.connected = False # workload
+        self.workload_updated = False
+        self.scheduler_addr = None
+        self.storage_location = None # ccache
+        self.workload_path = None
+
+        if charm is None:
+            return
+
+        self.container = charm.unit.get_container('icecream')
+
+        c = self.container
+        self.connected = c.can_connect()
+        if not self.connected:
+            return
+
+        process = c.exec(['printenv', 'PATH'])
+        envpath, stderr = process.wait_output()
+        self.workload_path = envpath.strip()
+
+        r = self.charm.model.get_relation('nodes')
+        if 'scheduler_addr' in r.data[self.charm.app]:
+            self.scheduler_addr = r.data[self.charm.app]['scheduler_addr']
+
+        if 'ccache' in charm.model.storages:
+            self.storage_location = charm.model.storages['ccache'][0].location
+
+    def need_worker_restart(self):
+        return self.connected and self.scheduler_addr # and <layer changed?>
+
+    def worker_layer(self):
+        env = {}
+        if self._do_ccache():
+            env['CCACHE_PREFIX'] = 'icecc'
+            env['CCACHE_DIR'] = str(self.storage_location)
+            env['PATH'] = '/usr/lib/ccache:{}'.format(self.workload_path)
+
+        return {
+            "services": {
+                "iceccd": {
+                    "override": "replace",
+                    "summary": "icecream worker service",
+                    "command": "iceccd -vvv -s {}".format(self.scheduler_addr),
+                    "startup": "enabled",
+                    "environment": env,
+                }
+            },
+        }
+
+    def _do_ccache(self):
+        return self.storage_location is not None and self.charm.config['ccache']
 
 
 if __name__ == "__main__":

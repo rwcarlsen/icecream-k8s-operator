@@ -20,6 +20,12 @@ containers:
   icecream:
     resource: icecream-image
 
+storage:
+  ccache:
+    type: filesystem
+    description: ccache shared directory
+    minimum-size: 200M
+
 # TEMPLATE-TODO: each container defined above must specify an oci-image resource
 resources:
   icecream-image:
